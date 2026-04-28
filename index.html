@@ -130,7 +130,7 @@
 
         // Configuration
         const PROXIMITY_THRESHOLD = 20; // Pixels
-        const IOU_DUPLICATE_THRESHOLD = 0.6; // If 60% overlap, it's a double-counted single item
+        const IOU_DUPLICATE_THRESHOLD = 0.85; // Allow boxes to overlap up to 85% before considering them duplicates
 
         // Phase 1: Initialize Camera (Environment Mode)
         async function setupCamera() {
@@ -173,7 +173,10 @@
             }
 
             // Get predictions
-            const predictions = await model.detect(video);
+            // detect(image, maxNumBoxes, minScore)
+            // Max 100 items, require only 30% confidence
+            const predictions = await model.detect(video, 100, 0.30);
+            
             processAndDraw(predictions);
             
             // Loop
