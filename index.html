@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Live Counting & Stacking App</title>
+    
+    <!-- Phase 2: TensorFlow.js & COCO-SSD via CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+    <style>
+        /* Phase 1: Clean, Mobile-friendly CSS */
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        #camera-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Both video and canvas fill the screen exactly identically */
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        canvas {
+            z-index: 10;
+        }
+
+        /* Phase 3 UI Panel */
+        #ui-panel {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(8px);
+            color: #fff;
+            padding: 20px 30px;
+            border-radius: 16px;
+            z-index: 20;
+            width: 80%;
+            max-width: 350px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 10px 0;
+            font-size: 1.1rem;
+        }
+
+        .stat-row:first-child { margin-top: 0; }
+        .stat-row:last-child { margin-bottom: 0; }
+
+        .label {
+            color: #94a3b8;
+            font-weight: 500;
+        }
+
+        .value {
+            font-weight: bold;
+            font-size: 1.4rem;
+        }
+
+        .total-value { color: #4ade80; } /* Green */
+        .stack-value { color: #f43f5e; } /* Rose */
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 20px 30px;
+            border-radius: 12px;
+            z-index: 30;
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Loading AI Model...</div>
+
+    <div id="camera-container">
+        <!-- playsinline is required for iOS Safari -->
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="ui-panel">
+        <div class="stat-row">
+            <span class="label">Total Items:</span>
+            <span class="value total-value" id="total-count">0</span>
+        </div>
+        <div class="stat-row">
+            <span class="label">Distinct Stacks:</span>
+            <span class="value stack-value" id="stack-count">0</span>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+        let model = null;
+
+        // Configuration
+        const PROXIMITY_THRESHOLD = 20; // Pixels
+        const IOU_DUPLICATE_THRESHOLD = 0.6; // If 60% overlap, it's a double-counted single item
+
+        // Phase 1: Initialize Camera (Environment Mode)
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' },
+                    audio: false
+                });
+                video.srcObject = stream;
+                
+                return new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        // Match canvas resolution exactly to the video feed resolution
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        resolve(video);
+                    };
+                });
+            } catch (err) {
+                alert("Camera access denied or unavailable.");
+                console.error(err);
+            }
+        }
+
+        // Phase 2: Load Model & Run Detection
+        async function loadModelAndStart() {
+            await setupCamera();
+            video.play();
+
+            model = await cocoSsd.load();
+            document.getElementById('loading').style.display = 'none';
+            
+            detectFrame(); // Start loop
+        }
+
+        async function detectFrame() {
+            if (video.readyState !== 4) {
+                requestAnimationFrame(detectFrame);
+                return;
+            }
+
+            // Get predictions
+            const predictions = await model.detect(video);
+            processAndDraw(predictions);
+            
+            // Loop
+            requestAnimationFrame(detectFrame);
+        }
+
+        // Phase 3: Advanced Stacking & Deduplication Logic
+        function processAndDraw(predictions) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            /* Step 1: Deduplication (Prevent Double Counting)
+               Object detectors sometimes draw 2 boxes on 1 object. 
+               We filter them out using Intersection over Union (IoU) */
+            let cleanPredictions =[];
+            predictions.forEach(p => {
+                let isDuplicate = false;
+                for (let i = 0; i < cleanPredictions.length; i++) {
+                    let c = cleanPredictions[i];
+                    if (calculateIoU(p.bbox, c.bbox) > IOU_DUPLICATE_THRESHOLD) {
+                        isDuplicate = true;
+                        // Keep the prediction with higher confidence
+                        if (p.score > c.score) cleanPredictions[i] = p;
+                        break;
+                    }
+                }
+                if (!isDuplicate) cleanPredictions.push(p);
+            });
+
+            /* Step 2: Stacking (Clustering) Logic
+               Group items if they are within PROXIMITY_THRESHOLD of each other */
+            let stacks =[]; // Array of groups. Each group is an array of predictions.
+            
+            cleanPredictions.forEach(pred => {
+                let matchedStacks =[];
+                
+                for (let i = 0; i < stacks.length; i++) {
+                    let stack = stacks[i];
+                    // Check if current item touches any item already in the stack
+                    let belongsToStack = stack.some(stackItem => 
+                        checkProximityIntersection(pred.bbox, stackItem.bbox, PROXIMITY_THRESHOLD)
+                    );
+                    if (belongsToStack) matchedStacks.push(i);
+                }
+
+                if (matchedStacks.length === 0) {
+                    // Start a new stack
+                    stacks.push([pred]);
+                } else {
+                    // Add to the first matched stack
+                    let firstStackIdx = matchedStacks[0];
+                    stacks[firstStackIdx].push(pred);
+
+                    // If it bridges multiple stacks, merge those stacks together
+                    if (matchedStacks.length > 1) {
+                        for (let j = matchedStacks.length - 1; j >= 1; j--) {
+                            let idxToMerge = matchedStacks[j];
+                            stacks[firstStackIdx].push(...stacks[idxToMerge]);
+                            stacks.splice(idxToMerge, 1);
+                        }
+                    }
+                }
+            });
+
+            // Step 3: Draw Standard Bounding Boxes
+            cleanPredictions.forEach(pred => {
+                const [x, y, width, height] = pred.bbox;
+                ctx.strokeStyle = '#4ade80'; // Green
+                ctx.lineWidth = 2;
+                ctx.strokeRect(x, y, width, height);
+
+                ctx.fillStyle = '#4ade80';
+                ctx.font = 'bold 16px sans-serif';
+                ctx.fillText(`${pred.class} (${Math.round(pred.score * 100)}%)`, x, y > 20 ? y - 6 : y + 20);
+            });
+
+            // Step 4: Draw Stack Groupings
+            stacks.forEach((stack, index) => {
+                if (stack.length > 1) {
+                    // Calculate encompassing bounding box for the whole stack
+                    let minX = Math.min(...stack.map(p => p.bbox[0]));
+                    let minY = Math.min(...stack.map(p => p.bbox[1]));
+                    let maxX = Math.max(...stack.map(p => p.bbox[0] + p.bbox[2]));
+                    let maxY = Math.max(...stack.map(p => p.bbox[1] + p.bbox[3]));
+
+                    ctx.strokeStyle = '#f43f5e'; // Rose / Pink for stacks
+                    ctx.lineWidth = 3;
+                    ctx.setLineDash([8, 6]); // Dashed line to differentiate
+                    ctx.strokeRect(minX - 10, minY - 10, (maxX - minX) + 20, (maxY - minY) + 20);
+                    ctx.setLineDash([]); // Reset line dash
+                    
+                    ctx.fillStyle = '#f43f5e';
+                    ctx.font = 'bold 18px sans-serif';
+                    ctx.fillText(`Stack (${stack.length} items)`, minX - 10, minY - 15);
+                }
+            });
+
+            // Step 5: Update Live Count UI
+            document.getElementById('total-count').innerText = cleanPredictions.length;
+            document.getElementById('stack-count').innerText = stacks.length;
+        }
+
+        // --- Helper Math Functions ---
+
+        // Checks if two boxes intersect when expanded by a specific proximity (pixels)
+        function checkProximityIntersection(box1, box2, padding) {
+            const [x1, y1, w1, h1] = box1;
+            const [x2, y2, w2, h2] = box2;
+
+            const px1 = x1 - padding;
+            const py1 = y1 - padding;
+            const pw1 = w1 + padding * 2;
+            const ph1 = h1 + padding * 2;
+
+            return !(px1 > x2 + w2 || px1 + pw1 < x2 || py1 > y2 + h2 || py1 + ph1 < y2);
+        }
+
+        // Calculates Intersection over Union (IoU) to detect duplicate AI guesses
+        function calculateIoU(box1, box2) {
+            const[x1, y1, w1, h1] = box1;
+            const[x2, y2, w2, h2] = box2;
+
+            const intersectionX = Math.max(0, Math.min(x1 + w1, x2 + w2) - Math.max(x1, x2));
+            const intersectionY = Math.max(0, Math.min(y1 + h1, y2 + h2) - Math.max(y1, y2));
+            const intersectionArea = intersectionX * intersectionY;
+
+            const area1 = w1 * h1;
+            const area2 = w2 * h2;
+            const unionArea = area1 + area2 - intersectionArea;
+
+            return intersectionArea / unionArea;
+        }
+
+        // Boot up
+        window.addEventListener('DOMContentLoaded', loadModelAndStart);
+    </script>
+</body>
+</html>
